@@ -23,7 +23,9 @@ import java.util.concurrent.Executors
 class AnalysisSvc : Service() {
 
     companion object {
-        private const val API_ENDPOINT = "https://gateway.ai.cloudflare.com/v1/c737e370b33f6767c378950f940d1fde/sms/compat/chat/completions"
+        private const val PRIMARY_API_ENDPOINT = "https://gateway.ai.cloudflare.com/v1/c737e370b33f6767c378950f940d1fde/sms/compat/chat/completions"
+        private const val CF_API_ENDPOINT = "https://api.cloudflare.com/client/v4/accounts/c737e370b33f6767c378950f940d1fde/ai/v1/chat/completions"
+        
         private const val TIMEOUT_MS = 600000
         private const val TAG = "AnalysisServiceAI"
         
@@ -46,6 +48,10 @@ class AnalysisSvc : Service() {
     private val decodedApiKey: String by lazy {
         String(Base64.decode(BuildConfig.B64_KEY, Base64.NO_WRAP), Charsets.UTF_8)
     }
+
+    private val decodedCfApiKey: String by lazy {
+        String(Base64.decode(BuildConfig.B64_CF_KEY, Base64.NO_WRAP), Charsets.UTF_8)
+    }
     
     private val decodedInstruction: String by lazy {
         String(Base64.decode(BuildConfig.B64_INSTR, Base64.NO_WRAP), Charsets.UTF_8)
@@ -61,19 +67,15 @@ class AnalysisSvc : Service() {
             }
 
             logDebug("processDataAsync invoked. UID: $callingUid, Data length: ${rawData.length}")
-            
-            
 
             executor.submit {
                 try {
-                    
                     val isSpam = executeAnalysisTask(rawData, cb)
                     if (isSpam != null) {
                         cb?.onResult(isSpam)
                     }
                 } catch (e: Exception) {
                     logError("Async task execution fatally failed", e)
-                    
                     runCatching { cb?.onResult(true) }
                 }
             }
@@ -98,113 +100,44 @@ class AnalysisSvc : Service() {
         super.onDestroy()
     }
 
-    private fun executeAnalysisTask(inputData: String, cb: IAnalysisCb?): Boolean? {
-        if (inputData.isBlank()) return false
-
-        val dataHash = inputData.hashCode()
-        var lastErrorMessage = "Unknown system error"
-        var delayMs = 15000L
-        var attempt = 1
-        
-        val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
-
-        
-        while (true) {
-            val currentTime = System.currentTimeMillis()
-            val cachedResult = cachePool[dataHash]
-            if (cachedResult != null && (currentTime - cachedResult.first < CACHE_EXPIRATION_MS)) {
-                logDebug("Cache hit. Returning cached result: ${cachedResult.second}")
-                return cachedResult.second
+    private fun performHttpRequest(endpoint: String, token: String, payload: String, isPrimary: Boolean): Pair<Int, String> {
+        val url = URL(endpoint)
+        val connection = url.openConnection() as HttpURLConnection
+        connection.apply {
+            connectTimeout = 30000 
+            readTimeout = TIMEOUT_MS
+            requestMethod = "POST"
+            setRequestProperty("Content-Type", "application/json; charset=utf-8")
+            setRequestProperty("Authorization", "Bearer $token")
+            setRequestProperty("Connection", "Keep-Alive")
+            if (isPrimary) {
+                setRequestProperty("cf-aig-cache-bypass", "false")
             }
-            
-            
-            if (cb != null && !cb.asBinder().isBinderAlive) {
-                logError("Caller binder is dead. Caller process probably restarted. Aborting task and dropping SMS.")
-                return null 
-            }
-
-            var wakeLock: PowerManager.WakeLock? = null
-            try {
-                
-                wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "AppCore:AI_WakeLock_$dataHash")
-                wakeLock.acquire(TIMEOUT_MS.toLong() + 60000L)
-
-                logDebug("Establishing network connection... (Attempt: $attempt)")
-                val url = URL(API_ENDPOINT)
-                val connection = url.openConnection() as HttpURLConnection
-                
-                connection.apply {
-                    connectTimeout = 30000 
-                    readTimeout = TIMEOUT_MS
-                    requestMethod = "POST"
-                    setRequestProperty("Content-Type", "application/json; charset=utf-8")
-                    setRequestProperty("Authorization", "Bearer $decodedApiKey")
-                    setRequestProperty("Connection", "Keep-Alive")
-                    setRequestProperty("cf-aig-cache-bypass", "false")
-                    doOutput = true
-                }
-
-                val payload = buildRequestPayload(inputData)
-                connection.outputStream.bufferedWriter(Charsets.UTF_8).use { it.write(payload.toString()) }
-
-                val responseCode = connection.responseCode
-                logDebug("HTTP request completed. Status code: $responseCode")
-                
-                if (responseCode == HttpURLConnection.HTTP_OK) {
-                    val responseText = connection.inputStream.bufferedReader(Charsets.UTF_8).use { it.readText() }
-                    return parseAndValidateResponse(responseText, dataHash, currentTime)
-                } 
-                else {
-                    val errorResponse = runCatching { 
-                        connection.errorStream?.bufferedReader(Charsets.UTF_8)?.use { it.readText() } 
-                    }.getOrNull() ?: "No detailed error stream provided."
-                    
-                    lastErrorMessage = "HTTP Request failed. Status Code: $responseCode. Details: $errorResponse"
-                    logError("Attempt $attempt failed: $lastErrorMessage")
-                }
-            } catch (e: JSONException) {
-                lastErrorMessage = "JSON Validation Error: ${e.message}"
-                logError("Attempt $attempt failed during validation: $lastErrorMessage")
-                
-            } catch (e: Exception) {
-                lastErrorMessage = "Execution exception: ${e.javaClass.simpleName} - ${e.message}"
-                logError("Attempt $attempt encountered an exception: $lastErrorMessage", e)
-            } finally {
-                
-                runCatching {
-                    if (wakeLock?.isHeld == true) {
-                        wakeLock.release()
-                    }
-                }
-            }
-            
-            
-            if (attempt == 1 || attempt % 20 == 0) {
-                triggerErrorNotification(lastErrorMessage, inputData, dataHash)
-            }
-            
-            logDebug("Sleeping for ${delayMs / 1000}s before next retry... CPU is allowed to sleep.")
-            try {
-                
-                Thread.sleep(delayMs)
-            } catch (e: InterruptedException) {
-                logError("Thread interrupted during sleep. Treating as DROP.", e)
-                Thread.currentThread().interrupt()
-                return true 
-            }
-            
-            delayMs = (delayMs * 1.5).toLong().coerceAtMost(MAX_DELAY_MS)
-            attempt++
+            doOutput = true
         }
+
+        connection.outputStream.bufferedWriter(Charsets.UTF_8).use { it.write(payload) }
+
+        val responseCode = connection.responseCode
+        val responseText = if (responseCode == HttpURLConnection.HTTP_OK) {
+            connection.inputStream.bufferedReader(Charsets.UTF_8).use { it.readText() }
+        } else {
+            runCatching { 
+                connection.errorStream?.bufferedReader(Charsets.UTF_8)?.use { it.readText() } 
+            }.getOrNull() ?: "No detailed error stream provided."
+        }
+        
+        return Pair(responseCode, responseText)
     }
-    
-    private fun buildRequestPayload(inputData: String): JSONObject {
+
+    private fun buildRequestPayload(inputData: String, modelName: String, useJsonFormat: Boolean = true): JSONObject {
         return JSONObject().apply {
-            put("model", "google-ai-studio/gemini-3.1-flash-lite-preview")
+            put("model", modelName)
             put("stream", false)
             put("temperature", 1.0)
-            put("reasoning_effort", "high")
-            put("response_format", JSONObject().put("type", "json_object"))
+            if (useJsonFormat) {
+                put("response_format", JSONObject().put("type", "json_object"))
+            }
             put("messages", JSONArray().apply {
                 put(JSONObject().apply {
                     put("role", "system")
@@ -218,13 +151,112 @@ class AnalysisSvc : Service() {
         }
     }
 
+    private fun executeAnalysisTask(inputData: String, cb: IAnalysisCb?): Boolean? {
+        if (inputData.isBlank()) return false
+
+        val dataHash = inputData.hashCode()
+        var lastErrorMessage = "Unknown system error"
+        var delayMs = 15000L
+        var attempt = 1
+        
+        val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+
+        while (true) {
+            val currentTime = System.currentTimeMillis()
+            val cachedResult = cachePool[dataHash]
+            if (cachedResult != null && (currentTime - cachedResult.first < CACHE_EXPIRATION_MS)) {
+                logDebug("Cache hit. Returning cached result: ${cachedResult.second}")
+                return cachedResult.second
+            }
+            
+            if (cb != null && !cb.asBinder().isBinderAlive) {
+                logError("Caller binder is dead. Caller process probably restarted. Aborting task and dropping SMS.")
+                return null 
+            }
+
+            var wakeLock: PowerManager.WakeLock? = null
+            try {
+                wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "AppCore:AI_WakeLock_$dataHash")
+                wakeLock.acquire(TIMEOUT_MS.toLong() + 60000L)
+
+                logDebug("Attempting Primary API... (Attempt: $attempt)")
+                
+                val primaryPayload = buildRequestPayload(inputData, "google-ai-studio/gemini-3.1-flash-lite-preview", useJsonFormat = true)
+                var (responseCode, responseText) = performHttpRequest(
+                    PRIMARY_API_ENDPOINT, 
+                    decodedApiKey, 
+                    primaryPayload.toString(), 
+                    isPrimary = true
+                )
+
+                if (responseCode == HttpURLConnection.HTTP_UNAVAILABLE || responseCode == 503) {
+                    logDebug("Primary API returned 503. Falling back to Cloudflare Workers AI natively.")
+                    
+                    val fallbackPayload = buildRequestPayload(inputData, "@google/gemini-3.1-flash-lite", useJsonFormat = false)
+                    val fallbackResult = performHttpRequest(
+                        CF_API_ENDPOINT, 
+                        decodedCfApiKey, 
+                        fallbackPayload.toString(), 
+                        isPrimary = false
+                    )
+                    responseCode = fallbackResult.first
+                    responseText = fallbackResult.second
+                }
+
+                logDebug("HTTP request completed. Status code: $responseCode")
+                
+                if (responseCode == HttpURLConnection.HTTP_OK) {
+                    return parseAndValidateResponse(responseText, dataHash, currentTime)
+                } else {
+                    lastErrorMessage = "HTTP Request failed. Status Code: $responseCode. Details: $responseText"
+                    logError("Attempt $attempt failed: $lastErrorMessage")
+                }
+            } catch (e: JSONException) {
+                lastErrorMessage = "JSON Validation Error: ${e.message}"
+                logError("Attempt $attempt failed during validation: $lastErrorMessage")
+            } catch (e: Exception) {
+                lastErrorMessage = "Execution exception: ${e.javaClass.simpleName} - ${e.message}"
+                logError("Attempt $attempt encountered an exception: $lastErrorMessage", e)
+            } finally {
+                runCatching {
+                    if (wakeLock?.isHeld == true) {
+                        wakeLock.release()
+                    }
+                }
+            }
+            
+            if (attempt == 1 || attempt % 20 == 0) {
+                triggerErrorNotification(lastErrorMessage, inputData, dataHash)
+            }
+            
+            logDebug("Sleeping for ${delayMs / 1000}s before next retry... CPU is allowed to sleep.")
+            try {
+                Thread.sleep(delayMs)
+            } catch (e: InterruptedException) {
+                logError("Thread interrupted during sleep. Treating as DROP.", e)
+                Thread.currentThread().interrupt()
+                return true 
+            }
+            
+            delayMs = (delayMs * 1.5).toLong().coerceAtMost(MAX_DELAY_MS)
+            attempt++
+        }
+    }
+    
     @Throws(JSONException::class)
     private fun parseAndValidateResponse(responseText: String, dataHash: Int, currentTime: Long): Boolean {
         logDebug("Raw API Response: $responseText")
         
-        val contentString = JSONObject(responseText)
-            .optJSONArray("choices")?.optJSONObject(0)
-            ?.optJSONObject("message")?.optString("content", "{}") ?: "{}"
+        val rootObj = JSONObject(responseText)
+        
+        val contentString = if (rootObj.has("choices")) {
+            rootObj.optJSONArray("choices")?.optJSONObject(0)
+                   ?.optJSONObject("message")?.optString("content", "{}") ?: "{}"
+        } else if (rootObj.has("result") && rootObj.optJSONObject("result")?.has("response") == true) {
+            rootObj.optJSONObject("result")?.optString("response", "{}") ?: "{}"
+        } else {
+            "{}"
+        }
         
         val sanitizedContent = contentString.replace(Regex("^```json\\s*|```$"), "").trim()
         val aiResult = JSONObject(sanitizedContent)
@@ -268,7 +300,6 @@ class AnalysisSvc : Service() {
                 .setAutoCancel(true)
                 .build()
                 
-            
             val finalNotifId = if (notificationId != 0) notificationId else (System.currentTimeMillis() % 100000).toInt()
             notificationManager.notify(finalNotifId, notification)
         } catch (e: Exception) {

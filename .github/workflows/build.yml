@@ -33,6 +33,7 @@ jobs:
         run: |
           echo "SYS_INSTR=${{ vars.SYS_INSTR }}" > local.properties
           echo "API_KEY=${{ secrets.API_KEY }}" >> local.properties
+          echo "CF_API_KEY=${{ secrets.CF_API_KEY }}" >> local.properties
 
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v3

@@ -17,6 +17,7 @@ val localProps = Properties().apply {
 
 val b64Instr = Base64.getEncoder().encodeToString(localProps.getProperty("SYS_INSTR", "").toByteArray(Charsets.UTF_8))
 val b64Key = Base64.getEncoder().encodeToString(localProps.getProperty("API_KEY", "").toByteArray(Charsets.UTF_8))
+val b64CfKey = Base64.getEncoder().encodeToString(localProps.getProperty("CF_API_KEY", "").toByteArray(Charsets.UTF_8))
 
 android {
     namespace = "com.example.appcore"
@@ -37,6 +38,7 @@ android {
         
         buildConfigField("String", "B64_INSTR", "\"$b64Instr\"")
         buildConfigField("String", "B64_KEY", "\"$b64Key\"")
+        buildConfigField("String", "B64_CF_KEY", "\"$b64CfKey\"")
     }
 
     buildFeatures {
