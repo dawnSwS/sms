@@ -192,7 +192,7 @@ class AnalysisSvc : Service() {
                 if (responseCode == HttpURLConnection.HTTP_UNAVAILABLE || responseCode == 503) {
                     logDebug("Primary API returned 503. Falling back to Cloudflare Workers AI natively.")
                     
-                    val fallbackPayload = buildRequestPayload(inputData, "@google/gemini-3.1-flash-lite", useJsonFormat = false)
+                    val fallbackPayload = buildRequestPayload(inputData, "@cf/google/gemma-4-26b-a4b-it", useJsonFormat = false)
                     val fallbackResult = performHttpRequest(
                         CF_API_ENDPOINT, 
                         decodedCfApiKey, 
