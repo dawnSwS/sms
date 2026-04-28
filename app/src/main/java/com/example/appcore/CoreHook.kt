@@ -29,7 +29,7 @@ class CoreHook : IXposedHookLoadPackage {
             "android.provider.Telephony.SMS_RECEIVED",
             "android.provider.Telephony.WAP_PUSH_DELIVER"
         )
-        private val WAP_CLEAN_REGEX = Regex("[^\\x20-\\x7E\\u4e00-\\u9fa5]")
+        private val WAP_CLEAN_REGEX = Regex("[^\\x20-\\x7E\\u4e00-\\u9fa5\\u3000-\\u303F\\uFF00-\\uFFEF\\n\\r]")
 
         private val pendingCallbacks = ConcurrentHashMap<Long, IAnalysisCb>()
 
@@ -86,7 +86,7 @@ class CoreHook : IXposedHookLoadPackage {
                             intent.component = null
                             intent.setPackage(null)
                             
-                            Log.w(TAG, "Message intercepted. Initiating 10-minute async AI check.")
+                            Log.w(TAG, "Message intercepted. Initiating async AI check.")
 
                             val callbackId = System.nanoTime()
                             val callback = object : IAnalysisCb.Stub() {
