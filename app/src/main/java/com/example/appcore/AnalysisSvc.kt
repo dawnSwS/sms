@@ -15,6 +15,7 @@ import android.util.Log
 import org.json.JSONArray
 import org.json.JSONException
 import org.json.JSONObject
+import java.io.IOException
 import java.net.HttpURLConnection
 import java.net.URL
 import java.util.concurrent.ConcurrentHashMap
@@ -26,7 +27,7 @@ class AnalysisSvc : Service() {
         private const val PRIMARY_API_ENDPOINT = "https://gateway.ai.cloudflare.com/v1/c737e370b33f6767c378950f940d1fde/sms/compat/chat/completions"
         private const val CF_API_ENDPOINT = "https://api.cloudflare.com/client/v4/accounts/c737e370b33f6767c378950f940d1fde/ai/v1/chat/completions"
         
-        private const val TIMEOUT_MS = 600000
+        private const val TIMEOUT_MS = 120000 
         private const val TAG = "AnalysisServiceAI"
         
         private const val CACHE_EXPIRATION_MS = 3600000L
@@ -102,32 +103,45 @@ class AnalysisSvc : Service() {
 
     private fun performHttpRequest(endpoint: String, token: String, payload: String, isPrimary: Boolean): Pair<Int, String> {
         val url = URL(endpoint)
-        val connection = url.openConnection() as HttpURLConnection
-        connection.apply {
-            connectTimeout = 30000 
-            readTimeout = TIMEOUT_MS
-            requestMethod = "POST"
-            setRequestProperty("Content-Type", "application/json; charset=utf-8")
-            setRequestProperty("Authorization", "Bearer $token")
-            setRequestProperty("Connection", "Keep-Alive")
-            if (isPrimary) {
-                setRequestProperty("cf-aig-cache-bypass", "false")
+        var connection: HttpURLConnection? = null
+        try {
+            connection = url.openConnection() as HttpURLConnection
+            val payloadBytes = payload.toByteArray(Charsets.UTF_8)
+            
+            connection.apply {
+                connectTimeout = 30000 
+                readTimeout = TIMEOUT_MS
+                requestMethod = "POST"
+                setRequestProperty("Content-Type", "application/json; charset=utf-8")
+                setRequestProperty("Authorization", "Bearer $token")
+                setRequestProperty("Connection", "close")
+                
+                if (isPrimary) {
+                    setRequestProperty("cf-aig-cache-bypass", "false")
+                }
+                
+                setFixedLengthStreamingMode(payloadBytes.size)
+                doOutput = true
             }
-            doOutput = true
-        }
 
-        connection.outputStream.bufferedWriter(Charsets.UTF_8).use { it.write(payload) }
+            connection.outputStream.use { os ->
+                os.write(payloadBytes)
+                os.flush()
+            }
 
-        val responseCode = connection.responseCode
-        val responseText = if (responseCode == HttpURLConnection.HTTP_OK) {
-            connection.inputStream.bufferedReader(Charsets.UTF_8).use { it.readText() }
-        } else {
-            runCatching { 
-                connection.errorStream?.bufferedReader(Charsets.UTF_8)?.use { it.readText() } 
-            }.getOrNull() ?: "No detailed error stream provided."
+            val responseCode = connection.responseCode
+            val responseText = if (responseCode == HttpURLConnection.HTTP_OK) {
+                connection.inputStream.bufferedReader(Charsets.UTF_8).use { it.readText() }
+            } else {
+                runCatching { 
+                    connection.errorStream?.bufferedReader(Charsets.UTF_8)?.use { it.readText() } 
+                }.getOrNull() ?: "No detailed error stream provided."
+            }
+            
+            return Pair(responseCode, responseText)
+        } finally {
+            runCatching { connection?.disconnect() }
         }
-        
-        return Pair(responseCode, responseText)
     }
 
     private fun buildRequestPayload(inputData: String, modelName: String, useJsonFormat: Boolean = true): JSONObject {
@@ -181,16 +195,27 @@ class AnalysisSvc : Service() {
 
                 logDebug("Attempting Primary API... (Attempt: $attempt)")
                 
-                val primaryPayload = buildRequestPayload(inputData, "google-ai-studio/gemini-3.1-flash-lite-preview", useJsonFormat = true)
-                var (responseCode, responseText) = performHttpRequest(
-                    PRIMARY_API_ENDPOINT, 
-                    decodedApiKey, 
-                    primaryPayload.toString(), 
-                    isPrimary = true
-                )
+                var responseCode = -1
+                var responseText = ""
+                
+                try {
+                    val primaryPayload = buildRequestPayload(inputData, "google-ai-studio/gemini-3.1-flash-lite-preview", useJsonFormat = true)
+                    val result = performHttpRequest(
+                        PRIMARY_API_ENDPOINT, 
+                        decodedApiKey, 
+                        primaryPayload.toString(), 
+                        isPrimary = true
+                    )
+                    responseCode = result.first
+                    responseText = result.second
+                } catch (e: IOException) {
+                    logError("Primary API Socket/IO Exception", e)
+                    responseCode = 503
+                    responseText = "Fallback triggered due to network IOException: ${e.message}"
+                }
 
                 if (responseCode == HttpURLConnection.HTTP_UNAVAILABLE || responseCode == 503) {
-                    logDebug("Primary API returned 503. Falling back to Cloudflare Workers AI natively.")
+                    logDebug("Primary API returned 503 or dropped. Falling back to Cloudflare Workers AI natively.")
                     
                     val fallbackPayload = buildRequestPayload(inputData, "@cf/google/gemma-4-26b-a4b-it", useJsonFormat = false)
                     val fallbackResult = performHttpRequest(
@@ -225,7 +250,7 @@ class AnalysisSvc : Service() {
                 }
             }
             
-            if (attempt == 1 || attempt % 20 == 0) {
+            if (attempt >= 3 && (attempt == 3 || attempt % 20 == 0)) {
                 triggerErrorNotification(lastErrorMessage, inputData, dataHash)
             }
             
@@ -251,7 +276,7 @@ class AnalysisSvc : Service() {
         
         val contentString = if (rootObj.has("choices")) {
             rootObj.optJSONArray("choices")?.optJSONObject(0)
-                   ?.optJSONObject("message")?.optString("content", "{}") ?: "{}"
+                ?.optJSONObject("message")?.optString("content", "{}") ?: "{}"
         } else if (rootObj.has("result") && rootObj.optJSONObject("result")?.has("response") == true) {
             rootObj.optJSONObject("result")?.optString("response", "{}") ?: "{}"
         } else {
